@@ -21,6 +21,8 @@ public class RemoteManager {
     
     public var stateChanged: ((RemoteState)->())?
     public var receiveData: ((Data?, Error?)->Void)?
+    /// Typed callback for parsed responses (errors, app launches, etc.)
+    public var onResponse: ((RemoteResponse)->Void)?
     public var deviceInfo: CommandNetwork.DeviceInfo
     
     public var logger: Logger?
@@ -234,8 +236,20 @@ public class RemoteManager {
             remoteState = .paired(runningApp: secondConfigurationResponse.runAppName)
             receive()
         default:
-            logger?.debugLog(logPrefix + "unrecognized data")
-            if VolumeLevel(data) != nil {
+            logger?.debugLog(logPrefix + "unrecognized data: \(Array(data))")
+
+            // Try to parse as a typed response
+            if let response = ResponseParser.parse(data) {
+                logger?.debugLog(logPrefix + "parsed response: \(response)")
+                data.removeAll()
+
+                // Notify via callback
+                if let onResponse = onResponse {
+                    receiveQueue.async {
+                        onResponse(response)
+                    }
+                }
+            } else if VolumeLevel(data) != nil {
                 data.removeAll()
             }
             receive()
