@@ -7,24 +7,56 @@
 import Foundation
 
 /// Parsed response types from Android TV
-public enum RemoteResponse {
+public enum RemoteResponse: CustomStringConvertible {
     /// Error response - the TV rejected our request
     case error(RemoteErrorInfo)
 
-    /// App link launch response - TV echoes back the deep link URI
-    case appLinkResponse(uri: String)
+    /// Current app changed - contains package name
+    case currentApp(packageName: String)
 
-    /// App launch result (inferred from lack of error after sending deep link)
-    case appLaunchSuccess
+    /// Power state changed
+    case powerState(isOn: Bool)
 
-    /// Volume level update
-    case volumeLevel(Int)
+    /// Volume info updated
+    case volumeInfo(level: Int, max: Int, muted: Bool)
 
-    /// Current app changed
-    case currentApp(String)
+    /// Ping response (keepalive)
+    case pingResponse(val: Int)
+
+    /// Ping request from TV
+    case pingRequest(val: Int)
+
+    /// App link echo - TV echoes back the URI we sent
+    case appLinkEcho(uri: String)
+
+    /// Device configuration info
+    case deviceInfo(vendor: String, model: String, version: String)
 
     /// Unknown/unparsed response
     case unknown(Data)
+
+    public var description: String {
+        switch self {
+        case .error(let info):
+            return "Error: \(info.description)"
+        case .currentApp(let pkg):
+            return "Current App: \(pkg)"
+        case .powerState(let isOn):
+            return "Power: \(isOn ? "ON" : "OFF")"
+        case .volumeInfo(let level, let max, let muted):
+            return "Volume: \(level)/\(max) (muted: \(muted))"
+        case .pingResponse(let val):
+            return "Ping Response (\(val))"
+        case .pingRequest(let val):
+            return "Ping Request (\(val))"
+        case .appLinkEcho(let uri):
+            return "App Link Echo: \(uri)"
+        case .deviceInfo(let vendor, let model, let version):
+            return "Device: \(vendor) \(model) v\(version)"
+        case .unknown(let data):
+            return "Unknown (\(data.count) bytes)"
+        }
+    }
 }
 
 /// Details about a remote error
@@ -48,47 +80,84 @@ public struct RemoteErrorInfo {
 /// Parser for Android TV Remote protocol responses
 public class ResponseParser {
 
-    // Protobuf field tags (field_number << 3 | wire_type)
-    // Wire type 2 = length-delimited (for nested messages, strings)
-    // Wire type 0 = varint
+    // MARK: - Field Numbers (from protobuf schema)
+    // Tag = (field_number << 3) | wire_type
+    // Wire type 2 = length-delimited
 
-    /// RemoteError is field 3, wire type 2 = (3 << 3) | 2 = 26 = 0x1a
-    private static let remoteErrorTag: UInt8 = 0x1a
+    private enum FieldTag {
+        // Single-byte tags (field < 16)
+        static let remoteConfigure: UInt8 = 0x0A      // Field 1
+        static let remoteSetActive: UInt8 = 0x12     // Field 2
+        static let remoteError: UInt8 = 0x1A        // Field 3
+        static let remotePingRequest: UInt8 = 0x42  // Field 8
+        static let remotePingResponse: UInt8 = 0x4A // Field 9
 
-    /// AppLinkResponse is field 8, wire type 2 = (8 << 3) | 2 = 66 = 0x42
-    /// This is the TV echoing back the deep link URI after launch
-    private static let appLinkResponseTag: UInt8 = 0x42
-
-    /// RemoteAppLinkLaunchRequest is field 90, wire type 2 = (90 << 3) | 2 = 722
-    /// In varint: 722 = [0xd2, 0x05]
-    private static let appLinkRequestTag: [UInt8] = [0xd2, 0x05]
+        // Multi-byte tags (field >= 16, encoded as varint)
+        static let remoteImeKeyInject: [UInt8] = [0xA2, 0x01]  // Field 20 (current app)
+        static let remoteStart: [UInt8] = [0xC2, 0x02]         // Field 40 (power state)
+        static let remoteSetVolume: [UInt8] = [0xD2, 0x03]     // Field 50 (volume)
+        static let remoteAppLink: [UInt8] = [0xD2, 0x05]       // Field 90 (app link)
+    }
 
     /// Try to parse a response from raw data
     /// - Parameter data: Raw bytes received from the TV
     /// - Returns: Parsed response, or nil if not a recognized message
     public static func parse(_ data: Data) -> RemoteResponse? {
-        guard !data.isEmpty else { return nil }
+        guard data.count >= 2 else { return nil }
 
-        let bytes = Array(data)
+        var bytes = Array(data)
 
-        // Check for RemoteError (field 3)
-        if bytes.first == remoteErrorTag {
-            return parseRemoteError(bytes)
+        // Messages may have a length prefix - check if first byte(s) match message length
+        if let (length, lenBytes) = Decoder.decodeVarint(bytes), Int(length) == bytes.count - lenBytes {
+            // Skip the length prefix
+            bytes = Array(bytes.dropFirst(lenBytes))
         }
 
-        // Check for AppLinkResponse (field 8)
-        if bytes.first == appLinkResponseTag {
-            return parseAppLinkResponse(bytes)
+        guard !bytes.isEmpty else { return nil }
+
+        // Check for single-byte tags first
+        let firstByte = bytes[0]
+
+        switch firstByte {
+        case FieldTag.remoteError:
+            return parseRemoteError(bytes)
+        case FieldTag.remotePingRequest:
+            return parsePingRequest(bytes)
+        case FieldTag.remotePingResponse:
+            return parsePingResponse(bytes)
+        case FieldTag.remoteConfigure:
+            return parseDeviceInfo(bytes)
+        default:
+            break
+        }
+
+        // Check for multi-byte tags
+        if bytes.count >= 2 {
+            let twoBytes = Array(bytes.prefix(2))
+
+            if twoBytes == FieldTag.remoteImeKeyInject {
+                return parseCurrentApp(bytes)
+            }
+            if twoBytes == FieldTag.remoteStart {
+                return parsePowerState(bytes)
+            }
+            if twoBytes == FieldTag.remoteSetVolume {
+                return parseVolumeInfo(bytes)
+            }
+            if twoBytes == FieldTag.remoteAppLink {
+                return parseAppLinkEcho(bytes)
+            }
         }
 
         return .unknown(data)
     }
 
-    /// Parse a RemoteError message
-    private static func parseRemoteError(_ bytes: [UInt8]) -> RemoteResponse? {
-        guard bytes.count > 2, bytes[0] == remoteErrorTag else { return nil }
+    // MARK: - Individual Parsers
 
-        // Skip the tag byte and read the length
+    /// Parse RemoteError (field 3) - error response
+    private static func parseRemoteError(_ bytes: [UInt8]) -> RemoteResponse? {
+        guard bytes.count > 2, bytes[0] == FieldTag.remoteError else { return nil }
+
         guard let (length, lengthBytes) = Decoder.decodeVarint(Array(bytes.dropFirst())) else {
             return nil
         }
@@ -97,10 +166,6 @@ public class ResponseParser {
         guard bytes.count >= messageStart + Int(length) else { return nil }
 
         let messageBytes = Array(bytes[messageStart..<(messageStart + Int(length))])
-
-        // RemoteError structure:
-        // field 1 (bool value) = has error
-        // field 2 (RemoteMessage) = original request that caused error
 
         var hasError = false
         var originalRequest: Data? = nil
@@ -131,20 +196,134 @@ public class ResponseParser {
                     }
                 }
             default:
-                // Skip unknown field
-                break
+                if let skip = skipField(wireType: wireType, bytes: messageBytes, offset: offset) {
+                    offset = skip
+                }
             }
         }
 
         return .error(RemoteErrorInfo(hasError: hasError, originalRequest: originalRequest))
     }
 
-    /// Parse an AppLinkResponse message (field 8)
-    /// This is the TV echoing back the deep link URI after processing
-    private static func parseAppLinkResponse(_ bytes: [UInt8]) -> RemoteResponse? {
-        guard bytes.count > 2, bytes[0] == appLinkResponseTag else { return nil }
+    /// Parse RemoteImeKeyInject (field 20) - current app notification
+    private static func parseCurrentApp(_ bytes: [UInt8]) -> RemoteResponse? {
+        guard bytes.count > 3 else { return nil }
 
-        // Skip the tag byte and read the length
+        // Skip the 2-byte tag
+        var offset = 2
+
+        guard let (length, lengthBytes) = Decoder.decodeVarint(Array(bytes.dropFirst(offset))) else {
+            return nil
+        }
+        offset += lengthBytes
+
+        guard bytes.count >= offset + Int(length) else { return nil }
+
+        let messageBytes = Array(bytes[offset..<(offset + Int(length))])
+
+        // Look for app_info.app_package string in nested message
+        if let packageName = extractPackageName(from: messageBytes) {
+            return .currentApp(packageName: packageName)
+        }
+
+        return nil
+    }
+
+    /// Parse RemoteStart (field 40) - power state
+    private static func parsePowerState(_ bytes: [UInt8]) -> RemoteResponse? {
+        guard bytes.count > 3 else { return nil }
+
+        // Skip the 2-byte tag
+        var offset = 2
+
+        guard let (length, lengthBytes) = Decoder.decodeVarint(Array(bytes.dropFirst(offset))) else {
+            return nil
+        }
+        offset += lengthBytes
+
+        guard bytes.count >= offset + Int(length) else { return nil }
+
+        let messageBytes = Array(bytes[offset..<(offset + Int(length))])
+
+        // Look for field 1 (started: bool)
+        var fieldOffset = 0
+        while fieldOffset < messageBytes.count {
+            let fieldTag = messageBytes[fieldOffset]
+            fieldOffset += 1
+
+            let fieldNumber = fieldTag >> 3
+            let wireType = fieldTag & 0x07
+
+            if fieldNumber == 1 && wireType == 0 && fieldOffset < messageBytes.count {
+                let isOn = messageBytes[fieldOffset] != 0
+                return .powerState(isOn: isOn)
+            }
+
+            if let skip = skipField(wireType: wireType, bytes: messageBytes, offset: fieldOffset) {
+                fieldOffset = skip
+            }
+        }
+
+        return nil
+    }
+
+    /// Parse RemoteSetVolumeLevel (field 50) - volume info
+    private static func parseVolumeInfo(_ bytes: [UInt8]) -> RemoteResponse? {
+        guard bytes.count > 3 else { return nil }
+
+        // Skip the 2-byte tag
+        var offset = 2
+
+        guard let (length, lengthBytes) = Decoder.decodeVarint(Array(bytes.dropFirst(offset))) else {
+            return nil
+        }
+        offset += lengthBytes
+
+        guard bytes.count >= offset + Int(length) else { return nil }
+
+        let messageBytes = Array(bytes[offset..<(offset + Int(length))])
+
+        // RemoteSetVolumeLevel fields:
+        // field 1: volume_level (int)
+        // field 2: volume_max (int)
+        // field 3: volume_muted (bool)
+
+        var level = 0
+        var max = 100
+        var muted = false
+        var fieldOffset = 0
+
+        while fieldOffset < messageBytes.count {
+            let fieldTag = messageBytes[fieldOffset]
+            fieldOffset += 1
+
+            let fieldNumber = fieldTag >> 3
+            let wireType = fieldTag & 0x07
+
+            if wireType == 0 { // varint
+                guard let (value, valBytes) = Decoder.decodeVarint(Array(messageBytes.dropFirst(fieldOffset))) else {
+                    break
+                }
+                fieldOffset += valBytes
+
+                switch fieldNumber {
+                case 1: level = Int(value)
+                case 2: max = Int(value)
+                case 3: muted = value != 0
+                default: break
+                }
+            } else if let skip = skipField(wireType: wireType, bytes: messageBytes, offset: fieldOffset) {
+                fieldOffset = skip
+            }
+        }
+
+        return .volumeInfo(level: level, max: max, muted: muted)
+    }
+
+    /// Parse RemotePingRequest (field 8)
+    private static func parsePingRequest(_ bytes: [UInt8]) -> RemoteResponse? {
+        guard bytes.count > 2, bytes[0] == FieldTag.remotePingRequest else { return nil }
+
         guard let (length, lengthBytes) = Decoder.decodeVarint(Array(bytes.dropFirst())) else {
             return nil
         }
@@ -154,20 +333,103 @@ public class ResponseParser {
 
         let messageBytes = Array(bytes[messageStart..<(messageStart + Int(length))])
 
-        // Find the URI string embedded in the message
-        // Look for field 1 (string) with tag 0x0a at various nesting levels
-        if let uri = extractUriString(from: messageBytes) {
-            return .appLinkResponse(uri: uri)
+        // Look for field 1 (val1: int)
+        if messageBytes.count >= 2 && messageBytes[0] == 0x08 {
+            if let (val, _) = Decoder.decodeVarint(Array(messageBytes.dropFirst())) {
+                return .pingRequest(val: Int(val))
+            }
         }
 
-        // If we can't extract URI, still return success since field 8 means app link was processed
-        return .appLinkResponse(uri: "(parsed but URI not extracted)")
+        return .pingRequest(val: 0)
     }
 
-    /// Recursively search for a URI string in protobuf message bytes
-    private static func extractUriString(from bytes: [UInt8]) -> String? {
-        var offset = 0
+    /// Parse RemotePingResponse (field 9)
+    private static func parsePingResponse(_ bytes: [UInt8]) -> RemoteResponse? {
+        guard bytes.count > 2, bytes[0] == FieldTag.remotePingResponse else { return nil }
 
+        guard let (length, lengthBytes) = Decoder.decodeVarint(Array(bytes.dropFirst())) else {
+            return nil
+        }
+
+        let messageStart = 1 + lengthBytes
+        guard bytes.count >= messageStart + Int(length) else { return nil }
+
+        let messageBytes = Array(bytes[messageStart..<(messageStart + Int(length))])
+
+        // Look for field 1 (val1: int)
+        if messageBytes.count >= 2 && messageBytes[0] == 0x08 {
+            if let (val, _) = Decoder.decodeVarint(Array(messageBytes.dropFirst())) {
+                return .pingResponse(val: Int(val))
+            }
+        }
+
+        return .pingResponse(val: 0)
+    }
+
+    /// Parse RemoteConfigure (field 1) - device info
+    private static func parseDeviceInfo(_ bytes: [UInt8]) -> RemoteResponse? {
+        guard bytes.count > 2, bytes[0] == FieldTag.remoteConfigure else { return nil }
+
+        guard let (length, lengthBytes) = Decoder.decodeVarint(Array(bytes.dropFirst())) else {
+            return nil
+        }
+
+        let messageStart = 1 + lengthBytes
+        guard bytes.count >= messageStart + Int(length) else { return nil }
+
+        let messageBytes = Array(bytes[messageStart..<(messageStart + Int(length))])
+
+        // Look for device_info nested message and extract strings
+        var vendor = ""
+        var model = ""
+        var version = ""
+
+        // Find strings in nested structure
+        if let strings = extractAllStrings(from: messageBytes) {
+            if strings.count >= 1 { vendor = strings[0] }
+            if strings.count >= 2 { model = strings[1] }
+            if strings.count >= 3 { version = strings[2] }
+        }
+
+        if !vendor.isEmpty || !model.isEmpty {
+            return .deviceInfo(vendor: vendor, model: model, version: version)
+        }
+
+        return nil
+    }
+
+    /// Parse RemoteAppLinkLaunchRequest (field 90) - app link echo
+    private static func parseAppLinkEcho(_ bytes: [UInt8]) -> RemoteResponse? {
+        guard bytes.count > 3 else { return nil }
+
+        // Skip the 2-byte tag
+        var offset = 2
+
+        guard let (length, lengthBytes) = Decoder.decodeVarint(Array(bytes.dropFirst(offset))) else {
+            return nil
+        }
+        offset += lengthBytes
+
+        guard bytes.count >= offset + Int(length) else { return nil }
+
+        let messageBytes = Array(bytes[offset..<(offset + Int(length))])
+
+        // Look for field 1 (app_link: string)
+        if let uri = extractUriString(from: messageBytes) {
+            return .appLinkEcho(uri: uri)
+        }
+
+        return .appLinkEcho(uri: "(URI not extracted)")
+    }
+
+    // MARK: - Helper Functions
+
+    /// Extract package name from RemoteImeKeyInject message
+    private static func extractPackageName(from bytes: [UInt8]) -> String? {
+        // RemoteImeKeyInject contains RemoteAppInfo which has app_package
+        // Structure: field 1 = app_info (nested), which contains field 1 = app_package (string)
+
+        var offset = 0
         while offset < bytes.count {
             let fieldTag = bytes[offset]
             offset += 1
@@ -175,9 +437,50 @@ public class ResponseParser {
             let fieldNumber = fieldTag >> 3
             let wireType = fieldTag & 0x07
 
+            if wireType == 2 { // length-delimited
+                guard let (fieldLen, lenBytes) = Decoder.decodeVarint(Array(bytes.dropFirst(offset))) else {
+                    return nil
+                }
+                offset += lenBytes
+
+                let fieldEnd = min(offset + Int(fieldLen), bytes.count)
+                let fieldData = Array(bytes[offset..<fieldEnd])
+
+                // Try to extract as string first
+                if let str = String(bytes: fieldData, encoding: .utf8),
+                   str.contains(".") && !str.contains(" ") && str.count > 3 {
+                    // Looks like a package name (e.g., com.netflix.ninja)
+                    return str
+                }
+
+                // Try nested message
+                if let nested = extractPackageName(from: fieldData) {
+                    return nested
+                }
+
+                offset = fieldEnd
+            } else if let skip = skipField(wireType: wireType, bytes: bytes, offset: offset) {
+                offset = skip
+            } else {
+                break
+            }
+        }
+
+        return nil
+    }
+
+    /// Extract URI string from nested message
+    private static func extractUriString(from bytes: [UInt8]) -> String? {
+        var offset = 0
+
+        while offset < bytes.count {
+            let fieldTag = bytes[offset]
+            offset += 1
+
+            let wireType = fieldTag & 0x07
+
             switch wireType {
             case 0: // Varint
-                // Skip varint value
                 while offset < bytes.count && (bytes[offset] & 0x80) != 0 {
                     offset += 1
                 }
@@ -195,13 +498,13 @@ public class ResponseParser {
                 let fieldEnd = min(offset + Int(fieldLen), bytes.count)
                 let fieldData = Array(bytes[fieldStart..<fieldEnd])
 
-                // Check if this looks like a URI string (starts with scheme)
+                // Check if this looks like a URI string
                 if let str = String(bytes: fieldData, encoding: .utf8),
                    (str.contains("://") || str.hasPrefix("market:")) {
                     return str
                 }
 
-                // Try to find URI in nested message
+                // Try nested message
                 if let nestedUri = extractUriString(from: fieldData) {
                     return nestedUri
                 }
@@ -209,11 +512,77 @@ public class ResponseParser {
                 offset = fieldEnd
 
             default:
-                // Unknown wire type, can't parse further
                 return nil
             }
         }
 
         return nil
+    }
+
+    /// Extract all strings from nested message
+    private static func extractAllStrings(from bytes: [UInt8]) -> [String]? {
+        var strings: [String] = []
+        var offset = 0
+
+        while offset < bytes.count {
+            let fieldTag = bytes[offset]
+            offset += 1
+
+            let wireType = fieldTag & 0x07
+
+            if wireType == 2 { // length-delimited
+                guard let (fieldLen, lenBytes) = Decoder.decodeVarint(Array(bytes.dropFirst(offset))) else {
+                    break
+                }
+                offset += lenBytes
+
+                let fieldEnd = min(offset + Int(fieldLen), bytes.count)
+                let fieldData = Array(bytes[offset..<fieldEnd])
+
+                if let str = String(bytes: fieldData, encoding: .utf8),
+                   !str.isEmpty && str.allSatisfy({ $0.isASCII }) {
+                    strings.append(str)
+                } else if let nested = extractAllStrings(from: fieldData) {
+                    strings.append(contentsOf: nested)
+                }
+
+                offset = fieldEnd
+            } else if let skip = skipField(wireType: wireType, bytes: bytes, offset: offset) {
+                offset = skip
+            } else {
+                break
+            }
+        }
+
+        return strings.isEmpty ? nil : strings
+    }
+
+    /// Skip a field based on wire type
+    private static func skipField(wireType: UInt8, bytes: [UInt8], offset: Int) -> Int? {
+        var newOffset = offset
+
+        switch wireType {
+        case 0: // Varint
+            while newOffset < bytes.count && (bytes[newOffset] & 0x80) != 0 {
+                newOffset += 1
+            }
+            return newOffset < bytes.count ? newOffset + 1 : nil
+
+        case 1: // 64-bit fixed
+            return newOffset + 8 <= bytes.count ? newOffset + 8 : nil
+
+        case 2: // Length-delimited
+            guard let (len, lenBytes) = Decoder.decodeVarint(Array(bytes.dropFirst(newOffset))) else {
+                return nil
+            }
+            newOffset += lenBytes + Int(len)
+            return newOffset <= bytes.count ? newOffset : nil
+
+        case 5: // 32-bit fixed
+            return newOffset + 4 <= bytes.count ? newOffset + 4 : nil
+
+        default:
+            return nil
+        }
     }
 }
